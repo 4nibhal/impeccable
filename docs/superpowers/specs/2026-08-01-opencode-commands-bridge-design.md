@@ -55,31 +55,71 @@ in `opencode/packages/opencode/src/command/index.ts:134-152` and
 
 For every Impeccable install into an OpenCode project, the build emits
 `<install-root>/.opencode/commands/impeccable.md`. Single file, fixed
-content, no per-sub-command proliferation.
+content, no per-sub-command proliferation. We also emit `<install-root>/.opencode/commands/<cmd>.md`
+per sub-command (so the slash menu exposes them individually), but
+each one is a thin redirect to the parent bridge.
+
+Frontmatter schema is strict per `opencode/packages/core/src/v1/config/command.ts:5-13`:
+`description`, `agent`, `model`, `variant`, `subtask`, `template` (body).
+OpenCode ignores every other field silently; we deliberately emit
+nothing else so users reading the file see only what OpenCode honours.
+
+**`impeccable.md` (the bridge):**
 
 ```markdown
 ---
-description: Impeccable design workflow — bridge to the impeccable skill (one parent skill, 23 sub-commands)
+description: Impeccable design workflow — load the impeccable skill and run the user's sub-command (audit, polish, critique, init, etc.)
 agent: build
 subtask: true
 ---
-Load the `impeccable` skill via the skill tool, then execute the user's
-request. Setup is mandatory: first run `node .opencode/skills/impeccable/scripts/context.mjs`,
-load the matching `reference/<routing or sub-command>.md`, and follow the
-skill's instructions. $ARGUMENTS holds the user's sub-command plus
-optional target.
+Load the `impeccable` skill via the skill tool (name: "impeccable"),
+then follow the skill's `Setup` and `Commands` sections.
 
-If the user wrote only `/impeccable`, read `reference/routing.md` and
-present the context-aware menu; never auto-run a sub-command.
+Always run the skill's mandatory setup first:
+
+1. `node <skill-base-dir>/scripts/context.mjs` — `<skill-base-dir>` is
+   the directory that contains the skill `SKILL.md`. Discover it from
+   the `skill` tool's response, or fall back to the project's
+   `.opencode/skills/impeccable/` or the global `~/.config/opencode/skills/impeccable/`.
+2. Load `reference/routing.md` from the skill to map sub-commands.
+3. If $ARGUMENTS is empty, present the context-aware menu described in
+   `routing.md`; never auto-run a sub-command.
+4. Otherwise, treat $ARGUMENTS as the sub-command plus optional target,
+   load the matching `reference/<sub-command>.md`, and follow it.
+
+The skill's `allowed-tools`, `version`, and `argument-hint`
+frontmatter fields are Claude-specific extensions and are silently
+ignored by OpenCode. Do not rely on them.
 ```
 
-Why one command, not 24:
+Why one bridge plus per-sub-command redirects (not a single one-fits-all
+bridge): the slash menu in OpenCode 1.18.10 lists every command under
+its filename (`commands/<name>.md` shows as `/<name>`), and the
+community pattern in `rmc03/Inventario-App/.opencode/commands/impeccable-audit.md`
+shows that per-sub-command files give both discoverability and a
+cleaner autocompletion. The body is a thin redirect so the bridge
+stays single-sourced.
 
-- Avoids slash-menu pollution (project policy in `CLAUDE.md:13`).
-- Centralises the route into `routing.md` and the per-sub-command
-  reference files that already exist.
-- Matches the architecture OpenCode itself uses for skill bridges
-  (`command/index.ts:134-152` produces one wrapper per skill).
+**`<cmd>.md` per sub-command (only when the body differs from the bridge):**
+
+The first iteration generates only the bridge plus per-sub-command
+files for commands whose body needs more than the bridge's routing.
+Concretely: `init.md` (loads `reference/init.md` and runs the interview
+flow), `audit.md` (loads `reference/audit.md`), and `polish.md`. Other
+sub-commands share the bridge. We will revisit after MVP measurement.
+
+Why the body's `node <skill-base-dir>/scripts/context.mjs` is
+parameterised and not absolute: PR #406 made the install path depend
+on `OPENCODE_CONFIG_DIR` / `XDG_CONFIG_HOME` / `~/.config/opencode`.
+A hardcoded absolute path breaks the moment the user installs the
+skill in a non-default location. The skill tool's response carries
+the resolved directory; the LLM extracts it.
+
+Why `subtask: true`: the impeccable skill body is verbose (9.4k
+characters in the present source, plus reference files). Running the
+bridge as a subagent keeps that volume out of the primary chat
+context. We confirm this is necessary by measuring token usage with
+and without `subtask: true` during the MVP validation.
 
 ### 2. `pin.mjs` for OpenCode
 
@@ -93,16 +133,26 @@ Pinned command file:
 
 ```markdown
 ---
-description: Impeccable sub-command shortcut — runs the <display name> workflow via /impeccable <command>
+description: Impeccable sub-command shortcut — runs the <display name> workflow
 agent: build
 subtask: true
 ---
-Run `/impeccable <command>` and follow its instructions. $ARGUMENTS
-holds any arguments the user typed after the pinned command name.
+Load the `impeccable` skill via the skill tool (name: "impeccable"),
+then run `node <skill-base-dir>/scripts/context.mjs`, then load
+`reference/<command>.md` and follow it. Treat the original pinned
+command's arguments as the target.
+
+$ARGUMENTS
 ```
 
 `unpin <command>` removes `<root>/.opencode/commands/impeccable-<command>.md`
 only (other harnesses untouched).
+
+Note: `pin <command>` for OpenCode coexists with the bridge. The
+bridge's autocompletion lists `impeccable`, `impeccable-<command>`,
+and any other per-sub-command files. The two paths route through the
+same skill; pins exist for one-keystroke access to a specific
+sub-command.
 
 ### 3. CLI install/update — `copyProviderCommands`
 
@@ -226,21 +276,15 @@ per `AGENTS.md` policy.
 
 ## Open questions for the user
 
-1. **Bridge body wording.** The current proposal tells the LLM to call
-   `skill({name:'impeccable'})` first. Acceptable, or do you prefer
-   a stricter body that hard-codes the `node .../context.mjs`
-   invocation? I lean toward the soft "load the skill, then run
-   the user's request" version because hard-coding scripts in a
-   command template is fragile across paths.
-2. **Pinned command naming.** I propose `impeccable-<command>`
-   (e.g. `impeccable-audit`). Alternative: `<command>` to match Claude's
-   behavior (a `pin audit` already produces `/audit` via `user-invocable`).
-   I lean toward `impeccable-<command>` for OpenCode because plain
-   `<command>` is more likely to collide with future OpenCode built-ins
-   (e.g. `/review` already exists in OpenCode today).
-3. **Global scope for commands.** PR #417 added migration for global
-   skills. Should the same safety apply to commands? I lean yes —
-   the cost of the safety net is one realpath + one lstat check.
+1. **Bridge body wording.** Resolved: portable, parameterised
+   `node <skill-base-dir>/scripts/context.mjs`. Validated against the
+   community pattern in `rmc03/Inventario-App/.opencode/commands/impeccable-audit.md`
+   and the OpenCode docs (`/docs/commands/`).
+2. **Pinned command naming.** Resolved: `impeccable-<command>` to
+   avoid collision with current and future OpenCode built-ins (`/review`,
+   `/init`, etc.).
+3. **Global scope for commands.** Resolved: same migration guards as
+   PR #417 for skills (realpath + lstat + dotfiles-repo check).
 
 ## Rollback
 
